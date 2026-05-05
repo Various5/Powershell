@@ -304,6 +304,90 @@ function Get-ActionPlan {
     [PSCustomObject]@{ Severity = $severity; Steps = $steps }
 }
 
+function Get-HyperVHostInventory {
+    [CmdletBinding()]
+    param([switch]$IncludeCluster)
+
+    if (-not (Get-Module -ListAvailable Hyper-V -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    Import-Module Hyper-V -ErrorAction SilentlyContinue | Out-Null
+
+    $clusterName = $null
+    $nodes = @($env:COMPUTERNAME)
+    if ($IncludeCluster) {
+        try {
+            $cluster = Get-Cluster -ErrorAction Stop
+            $clusterName = $cluster.Name
+            $nodes = (Get-ClusterNode).Name
+        } catch { }
+    }
+
+    $allVms = New-Object System.Collections.Generic.List[object]
+    foreach ($node in $nodes) {
+        try {
+            $vms = if ($node -eq $env:COMPUTERNAME) { Get-VM -ErrorAction Stop }
+                   else { Get-VM -ComputerName $node -ErrorAction Stop }
+
+            foreach ($vm in $vms) {
+                $sbEnabled = $null; $sbTemplate = $null; $vtpmEnabled = $null
+                $needsCheck = $false; $note = ''
+
+                if ($vm.Generation -eq 1) {
+                    $note = 'Gen1 – kein Secure Boot, ignorieren'
+                } else {
+                    try {
+                        $fw = if ($node -eq $env:COMPUTERNAME) { Get-VMFirmware -VMName $vm.Name -ErrorAction Stop }
+                              else { Get-VMFirmware -VMName $vm.Name -ComputerName $node -ErrorAction Stop }
+                        $sbEnabled  = ($fw.SecureBoot -eq 'On')
+                        $sbTemplate = $fw.SecureBootTemplate
+                    } catch { }
+
+                    try {
+                        $sec = if ($node -eq $env:COMPUTERNAME) { Get-VMSecurity -VMName $vm.Name -ErrorAction Stop }
+                               else { Get-VMSecurity -VMName $vm.Name -ComputerName $node -ErrorAction Stop }
+                        $vtpmEnabled = $sec.TpmEnabled
+                    } catch { }
+
+                    if ($sbEnabled) {
+                        $needsCheck = $true
+                        if ($sbTemplate -match 'UEFI Certificate Authority|OpenSourceShielded') {
+                            $note = 'Linux/Open-Source Template – separate Behandlung'
+                        } elseif ($vtpmEnabled) {
+                            $note = 'vTPM aktiv – BitLocker vor Trigger suspenden!'
+                        } else {
+                            $note = 'In der VM Toolkit ausführen'
+                        }
+                    } else {
+                        $note = 'Secure Boot deaktiviert'
+                    }
+                }
+
+                $allVms.Add([PSCustomObject]@{
+                    Host               = $node
+                    Name               = $vm.Name
+                    State              = $vm.State
+                    Generation         = $vm.Generation
+                    Version            = $vm.Version
+                    SecureBoot         = $sbEnabled
+                    SecureBootTemplate = $sbTemplate
+                    vTPM               = $vtpmEnabled
+                    NeedsCheck         = $needsCheck
+                    Note               = $note
+                })
+            }
+        } catch {
+            Write-Warning "Konnte VMs auf Host '$node' nicht abfragen: $($_.Exception.Message)"
+        }
+    }
+
+    [PSCustomObject]@{
+        ClusterName = $clusterName
+        Nodes       = $nodes
+        VMs         = $allVms
+    }
+}
+
 #endregion
 
 #region ===================== Display Functions ==========================
@@ -604,6 +688,107 @@ function Show-ActionPlan {
     Pause-AndContinue
 }
 
+function Show-HyperVHostInventory {
+    Write-Section 'Hyper-V VM Inventory'
+
+    if (-not (Get-Module -ListAvailable Hyper-V -ErrorAction SilentlyContinue)) {
+        Write-Host '  Hyper-V Modul nicht verfügbar.' -ForegroundColor Yellow
+        Write-Host '  Diese Option läuft nur auf einem Hyper-V Host.' -ForegroundColor DarkGray
+        Pause-AndContinue; return
+    }
+
+    # Cluster-Erkennung
+    $clusterAvailable = $false
+    try {
+        $null = Get-Command Get-Cluster -ErrorAction Stop
+        $null = Get-Cluster -ErrorAction Stop
+        $clusterAvailable = $true
+    } catch { }
+
+    $useCluster = $false
+    if ($clusterAvailable) {
+        Write-Host '  Failover Cluster erkannt.' -ForegroundColor Cyan
+        $resp = Read-Host '  Alle Cluster-Knoten abfragen? (j/N)'
+        $useCluster = ($resp -eq 'j')
+    }
+
+    Write-Host ''
+    Write-Host '  Sammle VM-Daten...' -ForegroundColor DarkGray
+    $inv = Get-HyperVHostInventory -IncludeCluster:$useCluster
+
+    if (-not $inv -or $inv.VMs.Count -eq 0) {
+        Write-Host '  Keine VMs gefunden.' -ForegroundColor Yellow
+        Pause-AndContinue; return
+    }
+
+    # Summary
+    Write-Host ''
+    Write-Host '─── Übersicht ───' -ForegroundColor Cyan
+    if ($inv.ClusterName) {
+        Write-Host ("  Cluster          : {0} ({1} Knoten)" -f $inv.ClusterName, $inv.Nodes.Count)
+    } else {
+        Write-Host ("  Host             : {0}" -f $env:COMPUTERNAME)
+    }
+
+    $total     = $inv.VMs.Count
+    $gen1      = @($inv.VMs | Where-Object { $_.Generation -eq 1 }).Count
+    $gen2      = @($inv.VMs | Where-Object { $_.Generation -eq 2 }).Count
+    $needCheck = @($inv.VMs | Where-Object { $_.NeedsCheck }).Count
+    $vtpmCount = @($inv.VMs | Where-Object { $_.vTPM }).Count
+    $linuxCount= @($inv.VMs | Where-Object { $_.SecureBootTemplate -match 'UEFI Certificate Authority|OpenSourceShielded' }).Count
+
+    Write-Host ("  Total VMs        : {0}" -f $total)
+    Write-Host ("  Gen1 (skip)      : {0}" -f $gen1) -ForegroundColor DarkGray
+    Write-Host ("  Gen2             : {0}" -f $gen2)
+    Write-Host ("  Mit vTPM         : {0}" -f $vtpmCount)
+    Write-Host ("  Linux/Open-Src   : {0}" -f $linuxCount) -ForegroundColor DarkYellow
+    Write-Host ("  Nachzuziehen     : {0}" -f $needCheck) -ForegroundColor $(if ($needCheck -gt 0) { 'Yellow' } else { 'Green' })
+
+    # Detail Table
+    Write-Host ''
+    Write-Host '─── Details ───' -ForegroundColor Cyan
+    $inv.VMs | Sort-Object Host, @{Expression='NeedsCheck';Descending=$true}, Name |
+        Format-Table -Wrap -Property `
+            @{N='Host';     E={$_.Host};               Width=14},
+            @{N='Name';     E={$_.Name};               Width=24},
+            @{N='State';    E={$_.State};              Width=8},
+            @{N='Gen';      E={$_.Generation};         Width=4},
+            @{N='Ver';      E={$_.Version};            Width=5},
+            @{N='SB';       E={$_.SecureBoot};         Width=6},
+            @{N='Template'; E={$_.SecureBootTemplate -replace 'Microsoft','MS'}; Width=22},
+            @{N='vTPM';     E={$_.vTPM};               Width=6},
+            @{N='Note';     E={$_.Note}} | Out-Host
+
+    # Empfehlungen
+    Write-Host '─── Empfehlungen ───' -ForegroundColor Cyan
+    if ($needCheck -eq 0) {
+        Write-Host '  Keine Gen2-VMs mit aktivem Secure Boot zu bearbeiten.' -ForegroundColor Green
+    } else {
+        Write-Host "  $needCheck VMs brauchen einen CA-Update-Check innerhalb der VM:" -ForegroundColor Yellow
+        Write-Host '  1. Auf jeder Gen2-VM mit Secure Boot dieses Toolkit ausführen (Option 1, 2 oder 8).'
+        Write-Host '  2. Vor dem Trigger: Bei vTPM + BitLocker zwingend BitLocker suspenden:'
+        Write-Host '       Suspend-BitLocker -MountPoint C: -RebootCount 1' -ForegroundColor DarkGray
+        Write-Host '  3. Linux-VMs (UEFI CA Template) separat behandeln – die brauchen ein'
+        Write-Host '     Update vom Distro-SHIM, nicht den Microsoft-Trigger.'
+        Write-Host '  4. Update-Sequenz pro VM: Patch -> BitLocker suspend -> Trigger -> Reboot -> Verify'
+    }
+
+    if ($linuxCount -gt 0) {
+        Write-Host ''
+        Write-Host "  ⚠ $linuxCount VMs mit Linux/UEFI CA Template gefunden – diese folgen einem" -ForegroundColor DarkYellow
+        Write-Host '    eigenen Workflow (siehe Distro-Doku, z.B. Ubuntu/RHEL SHIM-Update).' -ForegroundColor DarkYellow
+    }
+
+    # CSV Export
+    Write-Host ''
+    if ((Read-Host '  Inventar als CSV exportieren? (j/N)') -eq 'j') {
+        $csvPath = "$env:USERPROFILE\Desktop\HyperV_VM_Inventory_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
+        $inv.VMs | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+        Write-Host "  Exportiert nach: $csvPath" -ForegroundColor Green
+    }
+    Pause-AndContinue
+}
+
 function Invoke-DeploymentTrigger {
     Write-Section 'Update auslösen – AvailableUpdates = 0x5944' -Color Yellow
 
@@ -669,14 +854,26 @@ function Show-Help {
   Workflow für deine Umgebung:
   ────────────────────────────
   1. Inventar: Option 3 (Remote Check) gegen alle Server.
-  2. Pro Server: Option 8 (Action Plan) für tailored Empfehlung.
-  3. Hardware/Firmware: Option 5 für BIOS-Stand und OEM-Doku-Link.
-  4. Bei "Status-Key fehlt": LCU-Patchstand hochziehen.
-  5. Pilot-Server: Option 9 (Trigger setzen).
+  2. Auf Hyper-V Hosts: Option V – Gen2-VMs erkennen, die nachgezogen
+     werden müssen.
+  3. Pro Server/VM: Option 8 (Action Plan) für tailored Empfehlung.
+  4. Hardware/Firmware: Option 5 für BIOS-Stand und OEM-Doku-Link.
+  5. Bei "Status-Key fehlt": LCU-Patchstand hochziehen.
+  6. Pilot-Server: Option 9 (Trigger setzen).
      - 12h warten oder Task manuell starten.
      - Reboot.
      - Mit Option 4 verifizieren, dass 2023 CAs in Firmware sind.
-  6. Auf Server-Flotte ausrollen – idealerweise per GPO.
+  7. Auf Server-Flotte ausrollen – idealerweise per GPO.
+
+  Hyper-V Besonderheiten:
+  ───────────────────────
+  - Gen1-VMs: kein Secure Boot, ignorieren.
+  - Gen2-VMs: jede VM ist ihre eigene Firmware-Welt, Update muss IN
+    der VM laufen, nicht vom Host aus.
+  - vTPM + BitLocker: BitLocker vorher suspenden:
+      Suspend-BitLocker -MountPoint C: -RebootCount 1
+  - Linux-VMs (Template "UEFI Certificate Authority"): folgen einem
+    eigenen Workflow via Distro-SHIM, nicht Microsoft-Trigger.
 
   Wichtige Werte:
   ───────────────
@@ -727,6 +924,11 @@ function Show-Menu {
     Write-Host '   6) Patchstand & OS-Build'
     Write-Host '   7) Event-Log Details'
     Write-Host ''
+    if ($script:HasHyperV) {
+        Write-Host '  ── HYPER-V ──' -ForegroundColor DarkCyan
+        Write-Host '   V) Hyper-V VM Inventory (Gen2-VMs auf Host/Cluster)' -ForegroundColor Magenta
+        Write-Host ''
+    }
     Write-Host '  ── PLANUNG & AKTION ──' -ForegroundColor DarkCyan
     Write-Host '   8) Action Plan – was muss ich tun?' -ForegroundColor Green
     Write-Host '   9) Update auslösen (Trigger setzen)' -ForegroundColor Yellow
@@ -745,6 +947,9 @@ if (-not $isAdmin) {
     Start-Sleep -Seconds 2
 }
 
+# Hyper-V verfügbar?
+$script:HasHyperV = $null -ne (Get-Module -ListAvailable Hyper-V -ErrorAction SilentlyContinue)
+
 do {
     Show-Menu
     $choice = (Read-Host '  Auswahl').Trim().ToUpper()
@@ -758,6 +963,7 @@ do {
         '7' { Show-EventDetails }
         '8' { Show-ActionPlan }
         '9' { Invoke-DeploymentTrigger }
+        'V' { if ($script:HasHyperV) { Show-HyperVHostInventory } else { Write-Host '  Hyper-V nicht verfügbar.' -ForegroundColor Red; Start-Sleep -Seconds 1 } }
         'H' { Show-Help }
         'Q' { break }
         ''  { }
