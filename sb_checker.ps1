@@ -15,6 +15,24 @@
     Author : Varous
     Quelle : https://aka.ms/GetSecureBoot
     Run    : Als Administrator ausführen.
+
+    Version: 2.0 (2026-06)
+    Neu in 2.0 (nach mindcore.dk- und Microsoft-KB-Findings):
+      - WindowsUEFICA2023Capable (0/1/2) als verlässlichster Fertig-Indikator
+        (gelesen aus ...\Secureboot UND ...\Secureboot\Servicing).
+      - MicrosoftUpdateManagedOptIn wird ausgelesen und vom direkten Trigger
+        klar getrennt.
+      - Trigger prüft jetzt Voraussetzungen: geplanter Task vorhanden
+        (Juli-2024-CU+) und Payload-.bin / WinCS verfügbar (sonst 0x80070002).
+      - Trigger bietet Volles Bundle (0x5944), reversible Phase 1 (0x140) und
+        gegatete, irreversible Revocation-Phase (0x280).
+      - Transienter UEFICA2023Error 2147942750 wird als Staging-Signal erkannt,
+        nicht mehr als Fehler.
+      - BitLocker-Warnung (PCR 7) vor dem Boot-Manager-Wechsel.
+      - Erweiterte Event-IDs (1036/1043/1044/1045/1796/1798).
+
+    WICHTIG: Diese Datei als UTF-8 MIT BOM speichern, sonst zerschiesst
+    Windows PowerShell 5.1 die Umlaute/Box-Zeichen (ANSI-Fehlinterpretation).
 #>
 
 [CmdletBinding()]
@@ -60,6 +78,21 @@ function Get-SecureBootStatusLocal {
     $ca2023Error      = (Get-ItemProperty -Path $sbPath -Name 'UEFICA2023Error'   -ErrorAction SilentlyContinue).UEFICA2023Error
     $availableUpdates = (Get-ItemProperty -Path $sbPath -Name 'AvailableUpdates'  -ErrorAction SilentlyContinue).AvailableUpdates
 
+    # MicrosoftUpdateManagedOptIn (0x5944) = Opt-In für den von Windows Update gesteuerten
+    # Staged-Rollout. NICHT zu verwechseln mit AvailableUpdates=0x5944 (= direkter Trigger).
+    $managedOptIn = (Get-ItemProperty -Path $sbPath -Name 'MicrosoftUpdateManagedOptIn' -ErrorAction SilentlyContinue).MicrosoftUpdateManagedOptIn
+
+    # WindowsUEFICA2023Capable ist der verlässlichste Fertig-Indikator:
+    #   0 = 2023 CA nicht in der DB
+    #   1 = in der DB, aber Gerät bootet noch den alten 2011-Chain (Reboot fehlt)
+    #   2 = in der DB UND bootet vom 2023-signierten Boot Manager (= fertig)
+    # Je nach Build schreibt Windows den Wert unter ...\SecureBoot oder ...\SecureBoot\Servicing.
+    $ca2023Capable = $null
+    foreach ($p in @($sbPath, (Join-Path $sbPath 'Servicing'))) {
+        $v = (Get-ItemProperty -Path $p -Name 'WindowsUEFICA2023Capable' -ErrorAction SilentlyContinue).WindowsUEFICA2023Capable
+        if ($null -ne $v) { $ca2023Capable = [int]$v; break }
+    }
+
     $firmwareHas2023 = $null
     if ($sbSupported -and $sbEnabled) {
         try {
@@ -80,9 +113,23 @@ function Get-SecureBootStatusLocal {
             $null        { $summary = 'Status-Key fehlt – LCU-Patchstand prüfen.'; $needsAction = $true }
             default      { $summary = "Unbekannter Status: $ca2023Status"; $needsAction = $true }
         }
+
+        # WindowsUEFICA2023Capable überschreibt den Status-String, wo es verlässlicher ist.
+        switch ($ca2023Capable) {
+            2 { $summary = 'OK – 2023 CA in der DB und bootet vom 2023 Boot Manager (fertig).'; $needsAction = $false }
+            1 { $summary = '2023 CA ist in der DB, aber Boot Manager noch alt – ein Reboot fehlt (Stage 4).'; $needsAction = $true }
+        }
+
         if ($null -ne $ca2023Error -and $ca2023Error -ne 0) {
-            $hasError = $true
-            $summary += " UEFICA2023Error=0x$('{0:X}' -f $ca2023Error)."
+            # 2147942750 (0x8007015E) tritt nach AvailableUpdates=0x100 auf: Boot-Manager-Update
+            # ist gestaged und wartet auf Reboot. Das ist KEIN Fehler-Endzustand (klärt sich nach Reboot).
+            if ($ca2023Error -eq 2147942750) {
+                $needsAction = $true
+                $summary += ' Hinweis: UEFICA2023Error 2147942750 ist ein Staging-Signal (Reboot ausstehend), kein echter Fehler.'
+            } else {
+                $hasError = $true
+                $summary += " UEFICA2023Error=0x$('{0:X}' -f $ca2023Error)."
+            }
         }
     }
 
@@ -94,6 +141,14 @@ function Get-SecureBootStatusLocal {
         SecureBootEnabled   = $sbEnabled
         FirmwareHas2023CA   = $firmwareHas2023
         CA2023Status        = $ca2023Status
+        CA2023Capable       = $ca2023Capable
+        CA2023CapableText   = $(switch ($ca2023Capable) {
+                                  0 { '0 – nicht in DB' }
+                                  1 { '1 – in DB, alter Boot Manager (Reboot fehlt)' }
+                                  2 { '2 – in DB + 2023 Boot Manager (fertig)' }
+                                  default { if ($null -eq $ca2023Capable) { '<nicht gesetzt>' } else { "$ca2023Capable" } }
+                              })
+        ManagedOptIn        = if ($null -ne $managedOptIn) { '0x{0:X}' -f $managedOptIn } else { $null }
         CA2023ErrorCode     = if ($null -ne $ca2023Error)      { '0x{0:X}' -f $ca2023Error }      else { $null }
         AvailableUpdates    = if ($null -ne $availableUpdates) { '0x{0:X}' -f $availableUpdates } else { $null }
         NeedsAction         = $needsAction
@@ -235,7 +290,7 @@ function Get-SecureBootEvents {
     try {
         Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
-            Id        = 1795, 1797, 1800, 1801, 1803, 1808
+            Id        = 1036, 1043, 1044, 1045, 1795, 1796, 1797, 1798, 1800, 1801, 1803, 1808
             StartTime = $cutoff
         } -ErrorAction SilentlyContinue | Sort-Object TimeCreated -Descending
     } catch { @() }
@@ -258,6 +313,19 @@ function Get-ActionPlan {
         $steps.Add('Secure Boot ist im UEFI deaktiviert.')
         $steps.Add('Wenn Secure Boot gewünscht ist: im UEFI-Setup aktivieren, dann Toolkit erneut laufen lassen.')
         $steps.Add('Wenn bewusst deaktiviert (z.B. wegen Legacy-Bootloader): kein Handlungsbedarf, aber dokumentieren.')
+    }
+    elseif ($Status.CA2023Capable -eq 2) {
+        $severity = 'Info'
+        $steps.Add('[OK] Fertig. WindowsUEFICA2023Capable=2 – das Gerät bootet vom 2023-signierten Boot Manager.')
+        $steps.Add('Optional: Verifikation per Event-ID 1808 und Option 4 (Firmware-DB).')
+    }
+    elseif ($Status.CA2023Capable -eq 1) {
+        $severity = 'Action'
+        $steps.Add('Stage 4: 2023 CA ist in der Firmware-DB, aber der alte Boot Manager wird noch geladen.')
+        $steps.Add('Es fehlt nur noch EIN Reboot, um auf den 2023 Boot Manager zu wechseln.')
+        $steps.Add('1. Bei aktivem BitLocker vorher: Suspend-BitLocker -MountPoint C: -RebootCount 1')
+        $steps.Add('2. Reboot durchführen (in Low-Reboot-/Hotpatch-Umgebungen aktiv erzwingen!).')
+        $steps.Add('3. Danach erneut prüfen – Capable sollte auf 2 stehen.')
     }
     elseif ($Status.CA2023Status -eq 'Updated' -and $Status.FirmwareHas2023CA) {
         $severity = 'Info'
@@ -300,8 +368,9 @@ function Get-ActionPlan {
         $steps.Add('1. OEM-Firmware/BIOS-Stand prüfen und ggf. updaten (siehe Hardware-Info).')
         $steps.Add('2. Backup/Snapshot erstellen.')
         $steps.Add('3. Auf einem Pilot-System (gleiche Hardware-Generation) zuerst testen.')
-        $steps.Add('4. Trigger setzen via Menü-Option 9 oder GPO.')
-        $steps.Add('5. Nach Reboot Verifikation per Option 4 (Firmware-DB Check).')
+        $steps.Add('4. Voraussetzungen prüfen: Task "Secure-Boot-Update" vorhanden (Juli-2024-CU+) und Payload/WinCS da.')
+        $steps.Add('5. Trigger setzen via Menü-Option 9 (konservativ: erst Phase 1 / 0x140) oder GPO.')
+        $steps.Add('6. Nach Reboot Verifikation: WindowsUEFICA2023Capable sollte 2 sein (Option 1/4).')
     }
 
     if ($Hardware -and $null -ne $Hardware.BiosAgeYears -and $Hardware.BiosAgeYears -gt 3 -and -not $Hardware.IsVirtualMachine) {
@@ -421,6 +490,7 @@ function Format-StatusLine {
     Write-Host ("  {0,-22} : {1}" -f 'Secure Boot enabled',  $Result.SecureBootEnabled)
     Write-Host ("  {0,-22} : {1}" -f 'Firmware hat 2023 CA', $Result.FirmwareHas2023CA)
     Write-Host ("  {0,-22} : {1}" -f 'CA2023 Status',        $Result.CA2023Status)
+    Write-Host ("  {0,-22} : {1}" -f 'CA2023 Capable',       $Result.CA2023CapableText)
     Write-Host ("  {0,-22} : {1}" -f 'CA2023 Error',         $Result.CA2023ErrorCode)
     Write-Host ("  {0,-22} : {1}" -f 'AvailableUpdates',     $Result.AvailableUpdates)
     Write-Host ("  {0,-22} : {1}" -f 'Summary',              $Result.Summary) -ForegroundColor $color
@@ -458,10 +528,16 @@ function Show-DetailedInfoLocal {
                 Count    = $_.Count
                 LastSeen = ($_.Group | Select-Object -First 1).TimeCreated
                 Meaning  = switch ([int]$_.Name) {
+                    1036 { 'Boot-Zeit Kontext-Event (Eventtext lesen)' }
+                    1043 { 'Boot-Zeit Kontext-Event (Eventtext lesen)' }
+                    1044 { 'Boot-Zeit Kontext-Event (Eventtext lesen)' }
+                    1045 { 'Boot-Zeit Kontext-Event (Eventtext lesen)' }
                     1795 { 'Fehler beim Übergeben an Firmware' }
+                    1796 { 'DB/Variablen-Update Ereignis (Eventtext lesen)' }
                     1797 { 'Update fehlgeschlagen – 2023 CA fehlt in DB' }
+                    1798 { 'DB/Variablen-Update Ereignis (Eventtext lesen)' }
                     1800 { 'Reboot erforderlich' }
-                    1801 { 'Zertifikate/Boot Manager nicht angewandt' }
+                    1801 { 'Zertifikate/Boot Manager nicht (vollständig) angewandt' }
                     1803 { 'PK-signed KEK fehlt – OEM kontaktieren' }
                     1808 { 'Erfolg: 2023 CAs in Firmware' }
                 }
@@ -492,7 +568,7 @@ function Show-RemoteCheck {
 
     if ($results) {
         $results | Sort-Object NeedsAction, HasError -Descending |
-            Format-Table ComputerName, OS, SecureBootEnabled, CA2023Status,
+            Format-Table ComputerName, OS, SecureBootEnabled, CA2023Status, CA2023Capable,
                          FirmwareHas2023CA, NeedsAction, HasError, Summary -AutoSize -Wrap |
             Out-Host
     }
@@ -699,6 +775,7 @@ function Show-ActionPlan {
     Write-Host ("  BIOS                 : {0} ({1})" -f $hw.BiosVersion, $(if ($hw.BiosReleaseDate) { $hw.BiosReleaseDate.ToString('yyyy-MM-dd') }))
     Write-Host ("  Secure Boot          : {0}" -f $status.SecureBootEnabled)
     Write-Host ("  CA2023 Status        : {0}" -f $(if ($status.CA2023Status) { $status.CA2023Status } else { '<nicht gesetzt>' }))
+    Write-Host ("  CA2023 Capable       : {0}" -f $status.CA2023CapableText)
     Write-Host ("  Firmware hat 2023 CA : {0}" -f $status.FirmwareHas2023CA)
     Write-Host ("  Events letzte 30T    : {0}" -f $events.Count)
 
@@ -712,6 +789,12 @@ function Show-ActionPlan {
     Write-Host ('─── Empfehlung [{0}] ───' -f $plan.Severity) -ForegroundColor $sevColor
     foreach ($s in $plan.Steps) {
         Write-Host "  $s" -ForegroundColor $sevColor
+    }
+
+    if ($status.SecureBootEnabled -and $status.CA2023Capable -ne 2 -and $status.CA2023Status -ne 'Updated') {
+        Write-Host ''
+        Write-Host '─── Trigger-Voraussetzungen ───' -ForegroundColor Cyan
+        Show-PrereqLines -Pre (Test-SecureBootPrereqs)
     }
 
     if (-not $hw.IsVirtualMachine -and $status.SecureBootEnabled -and $status.CA2023Status -ne 'Updated') {
@@ -1005,8 +1088,57 @@ function Show-HyperVProcedure {
     }
 }
 
+function Test-SecureBootPrereqs {
+    # Prüft die Voraussetzungen, die der direkte Trigger zwingend braucht.
+    # Quellen: KB5025885 / Microsoft "Registry key updates" + mindcore.dk (v3/v4 Findings).
+    [CmdletBinding()] param()
+
+    # 1) Geplanter Task – wird vom Juli-2024-CU (oder neuer) mitgeliefert.
+    $task = $null
+    try { $task = Get-ScheduledTask -TaskPath '\Microsoft\Windows\PI\' -TaskName 'Secure-Boot-Update' -ErrorAction Stop } catch { }
+    $taskExists = $null -ne $task
+    $taskLastResult = $null
+    if ($taskExists) {
+        try { $taskLastResult = (Get-ScheduledTaskInfo -TaskPath '\Microsoft\Windows\PI\' -TaskName 'Secure-Boot-Update' -ErrorAction Stop).LastTaskResult } catch { }
+    }
+
+    # 2) Payload-Ordner mit .bin-Dateien. Fehlt er, schlägt der Legacy-Task mit 0x80070002 fehl.
+    $payloadPath = Join-Path $env:SystemRoot 'System32\SecureBootUpdates'
+    $payloadOk = $false; $binCount = 0
+    if (Test-Path $payloadPath) {
+        $binCount  = @(Get-ChildItem -Path $payloadPath -Filter '*.bin' -ErrorAction SilentlyContinue).Count
+        $payloadOk = $binCount -gt 0
+    }
+
+    # 3) WinCS (WinCsFlags.exe) – moderner Pfad, der ohne lokale .bin-Payload auskommt (Server 2022+/Win11 23H2+).
+    $winCsPath = Join-Path $env:SystemRoot 'System32\WinCsFlags.exe'
+    $winCsAvailable = Test-Path $winCsPath
+
+    [PSCustomObject]@{
+        TaskExists      = $taskExists
+        TaskLastResult  = $taskLastResult
+        PayloadPath     = $payloadPath
+        PayloadOk       = $payloadOk
+        BinCount        = $binCount
+        WinCsAvailable  = $winCsAvailable
+        WinCsPath       = $winCsPath
+        # Trigger über den Task ist nur sinnvoll, wenn Task da ist UND (Payload da ODER WinCS verfügbar)
+        CanTrigger      = $taskExists -and ($payloadOk -or $winCsAvailable)
+    }
+}
+
+function Show-PrereqLines {
+    param($Pre)
+    $taskColor = if ($Pre.TaskExists) { 'Green' } else { 'Red' }
+    Write-Host ("  {0,-26} : {1}" -f 'Secure-Boot-Update Task', $(if ($Pre.TaskExists) { 'vorhanden' } else { 'FEHLT (Juli-2024-CU oder neuer nötig)' })) -ForegroundColor $taskColor
+    $payColor = if ($Pre.PayloadOk) { 'Green' } elseif ($Pre.WinCsAvailable) { 'Yellow' } else { 'Red' }
+    Write-Host ("  {0,-26} : {1}" -f 'Payload (.bin)', $(if ($Pre.PayloadOk) { "OK ($($Pre.BinCount) Dateien)" } else { "FEHLT in $($Pre.PayloadPath) -> Risiko 0x80070002" })) -ForegroundColor $payColor
+    $csColor = if ($Pre.WinCsAvailable) { 'Green' } else { 'DarkGray' }
+    Write-Host ("  {0,-26} : {1}" -f 'WinCS (WinCsFlags.exe)', $(if ($Pre.WinCsAvailable) { 'verfügbar (umgeht .bin-Abhängigkeit)' } else { 'nicht vorhanden (nur Server 2022+/Win11 23H2+)' })) -ForegroundColor $csColor
+}
+
 function Invoke-DeploymentTrigger {
-    Write-Section 'Update auslösen – AvailableUpdates = 0x5944' -Color Yellow
+    Write-Section 'Update auslösen – Secure Boot 2023 CA' -Color Yellow
 
     Write-Host '  ACHTUNG: Dies stösst den Secure Boot 2023 CA-Rollout an.' -ForegroundColor Yellow
     Write-Host '    Vorher zwingend prüfen:' -ForegroundColor Yellow
@@ -1028,14 +1160,70 @@ function Invoke-DeploymentTrigger {
         Write-Host '  Abbruch: Secure Boot ist deaktiviert.' -ForegroundColor Red
         Pause-AndContinue; return
     }
-    if ($current.CA2023Status -eq 'Updated') {
-        Write-Host '  Hinweis: Status ist bereits "Updated" – nichts zu tun.' -ForegroundColor Green
+    if ($current.CA2023Status -eq 'Updated' -or $current.CA2023Capable -eq 2) {
+        Write-Host '  Hinweis: Gerät ist bereits fertig (Status "Updated" bzw. Capable=2) – nichts zu tun.' -ForegroundColor Green
         Pause-AndContinue; return
     }
 
-    Write-Host '  Bestätigung 1/2: Möchtest du den Trigger auf DIESEM Server setzen?' -ForegroundColor Yellow
-    $c1 = Read-Host '  Tippe "JA" zum Bestätigen'
-    if ($c1 -ne 'JA') { Write-Host '  Abgebrochen.' -ForegroundColor DarkGray; Pause-AndContinue; return }
+    # Voraussetzungen prüfen (Task + Payload/WinCS) – sonst läuft der Trigger ins Leere.
+    Write-Host '  ── Voraussetzungen ──' -ForegroundColor Cyan
+    $pre = Test-SecureBootPrereqs
+    Show-PrereqLines -Pre $pre
+    Write-Host ''
+    if (-not $pre.TaskExists) {
+        Write-Host '  Abbruch: Geplanter Task "Secure-Boot-Update" fehlt. Aktuellen CU (Juli 2024+) einspielen.' -ForegroundColor Red
+        Pause-AndContinue; return
+    }
+    if (-not $pre.PayloadOk -and -not $pre.WinCsAvailable) {
+        Write-Host '  WARNUNG: Weder .bin-Payload noch WinCS vorhanden – Trigger schlägt vermutlich mit 0x80070002 fehl.' -ForegroundColor Red
+        if ((Read-Host '  Trotzdem fortfahren? (j/N)') -ne 'j') { Pause-AndContinue; return }
+    }
+
+    # BitLocker-Warnung: PCR 7 ändert sich beim Boot-Manager-Wechsel.
+    try {
+        $blv = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
+        if ($blv.ProtectionStatus -eq 'On') {
+            Write-Host "  ⚠ BitLocker ist auf $($env:SystemDrive) AKTIV. PCR 7 ändert sich beim Boot-Manager-Wechsel." -ForegroundColor Yellow
+            Write-Host '    Empfohlen vor dem Reboot:  Suspend-BitLocker -MountPoint C: -RebootCount 1' -ForegroundColor DarkGray
+            Write-Host '    Recovery-Key-Escrow (Entra ID / AD) vorher verifizieren!' -ForegroundColor DarkGray
+            Write-Host ''
+        }
+    } catch { }
+
+    # Methode wählen
+    Write-Host '  Welche Methode?' -ForegroundColor Cyan
+    Write-Host '   1) Volles Bundle  AvailableUpdates=0x5944  (Microsoft IT-managed Standard – DB+KEK+Boot Manager)'
+    Write-Host '   2) Phase 1 nur     AvailableUpdates=0x140   (DB + Boot Manager, REVERSIBEL – konservativ)'
+    Write-Host '   3) Phase 2 REVOKE  AvailableUpdates=0x280   (2011 via DBX sperren – IRREVERSIBEL!)' -ForegroundColor Red
+    Write-Host '   Z) Zurück'
+    $m = (Read-Host '  Auswahl').Trim().ToUpper()
+    if ($m -eq 'Z' -or [string]::IsNullOrWhiteSpace($m)) { return }
+
+    $value = $null; $label = ''; $irreversible = $false
+    switch ($m) {
+        '1' { $value = 0x5944; $label = 'Volles Bundle (0x5944)' }
+        '2' { $value = 0x140;  $label = 'Phase 1 DB + Boot Manager (0x140, reversibel)' }
+        '3' { $value = 0x280;  $label = 'Phase 2 Revocation (0x280, IRREVERSIBEL)'; $irreversible = $true }
+        default { Write-Host '  Ungültig.' -ForegroundColor Red; Pause-AndContinue; return }
+    }
+
+    Write-Host ''
+    Write-Host "  Gewählt: $label" -ForegroundColor Yellow
+    if ($irreversible) {
+        Write-Host '  ⚠⚠ Diese Phase sperrt die 2011-Zertifikate per DBX. Solange Secure Boot aktiv ist,' -ForegroundColor Red
+        Write-Host '      gibt es KEINEN Rollback. Nur ausführen, wenn Capable=2 bereits erreicht und auf' -ForegroundColor Red
+        Write-Host '      identischer Pilot-Hardware validiert wurde.' -ForegroundColor Red
+        if ($current.CA2023Capable -ne 2) {
+            Write-Host '  Abbruch: Capable ist noch nicht 2. Erst Phase 1 abschliessen + Reboot.' -ForegroundColor Red
+            Pause-AndContinue; return
+        }
+    }
+    Write-Host ''
+
+    Write-Host '  Bestätigung 1/2: Trigger auf DIESEM Server setzen?' -ForegroundColor Yellow
+    $confirmWord = if ($irreversible) { 'REVOKE' } else { 'JA' }
+    $c1 = Read-Host "  Tippe `"$confirmWord`" zum Bestätigen"
+    if ($c1 -ne $confirmWord) { Write-Host '  Abgebrochen.' -ForegroundColor DarkGray; Pause-AndContinue; return }
 
     Write-Host ''
     Write-Host "  Bestätigung 2/2: Servername zur Verifikation eingeben ($env:COMPUTERNAME):" -ForegroundColor Yellow
@@ -1044,14 +1232,19 @@ function Invoke-DeploymentTrigger {
 
     try {
         New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' `
-            -Name 'AvailableUpdates' -Value 0x5944 -PropertyType DWord -Force | Out-Null
+            -Name 'AvailableUpdates' -Value $value -PropertyType DWord -Force | Out-Null
         Write-Host ''
-        Write-Host '  AvailableUpdates auf 0x5944 gesetzt.' -ForegroundColor Green
+        Write-Host ("  AvailableUpdates auf 0x{0:X} gesetzt." -f $value) -ForegroundColor Green
+        try {
+            Start-ScheduledTask -TaskPath '\Microsoft\Windows\PI\' -TaskName 'Secure-Boot-Update' -ErrorAction Stop
+            Write-Host '  Geplanter Task gestartet.' -ForegroundColor Green
+        } catch {
+            Write-Host '  Task konnte nicht sofort gestartet werden – läuft sonst automatisch (alle 12h).' -ForegroundColor DarkGray
+        }
         Write-Host '  Nächste Schritte:' -ForegroundColor Cyan
-        Write-Host '    - Geplanten Task triggern oder bis zu 12h warten:'
-        Write-Host '      Start-ScheduledTask -TaskPath ''\Microsoft\Windows\PI\'' -TaskName ''Secure-Boot-Update'''
-        Write-Host '    - Reboot, sobald Status auf "InProgress" wechselt.'
-        Write-Host '    - Nach Reboot dieses Script erneut laufen, Option 1 oder 2.'
+        Write-Host '    - Wenn AvailableUpdates auf 0x4100 steht: Reboot durchführen.'
+        Write-Host '    - Nach Reboot dieses Script erneut: Capable sollte Richtung 2 wandern.'
+        Write-Host '    - Verifikation mit Option 4 (Firmware-DB) und Option 1 (Capable=2).'
     } catch {
         Write-Host "  Fehler beim Setzen: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -1114,17 +1307,48 @@ function Show-Help {
   - Linux-VMs (Template "UEFI Certificate Authority"): folgen einem
     eigenen Workflow via Distro-SHIM, nicht Microsoft-Trigger.
 
-  Wichtige Werte:
-  ───────────────
-  AvailableUpdates  0x5944  -> Voller Rollout angestossen
-  AvailableUpdates  0x4104  -> KEK-Phase
-  AvailableUpdates  0x4100  -> Boot Manager-Phase ausstehend
-  AvailableUpdates  0x4000  -> Komplett, evtl. noch Reboot
+  Wichtige Werte (Pfad: HKLM\SYSTEM\CurrentControlSet\Control\Secureboot):
+  ──────────────────────────────────────────────────────────────────────
+  Zwei verschiedene 0x5944, NICHT verwechseln:
+    MicrosoftUpdateManagedOptIn = 0x5944
+        -> Opt-In für den von Windows Update gesteuerten Staged-Rollout
+           (hands-off, Microsoft liefert per WU). Braucht Required-Telemetrie
+           + laufenden DiagTrack-Dienst, sonst greift die WU-Sicherheitslogik nicht.
+    AvailableUpdates = 0x5944
+        -> Direkter Trigger: Windows arbeitet das volle Bundle JETZT ab
+           (DB + KEK + Boot Manager). Das ist der Server-/RMM-Weg.
+
+  AvailableUpdates – Bitmasken (werden nach erfolgreicher Verarbeitung gelöscht):
+    0x40   -> nur DB: Windows UEFI CA 2023 in die DB schreiben (Mitigation 1)
+    0x100  -> Boot Manager auf 2023-signiert umstellen (Mitigation 2)
+    0x140  -> 0x40 + 0x100 (DB + Boot Manager, REVERSIBEL) – konservative Phase 1
+    0x280  -> 2011 via DBX sperren + SVN-Bump – IRREVERSIBEL – Phase 2
+    0x5944 -> komplettes Bundle auf einmal (Microsoft IT-managed Standard)
+    Verlauf nach Trigger: 0x5944 -> 0x4100 (=Reboot fällig) -> 0x4000 -> 0x0 (fertig)
+
+  WindowsUEFICA2023Capable – der verlässlichste Fertig-Indikator:
+    0 -> 2023 CA nicht in der DB
+    1 -> in der DB, bootet aber noch alten 2011-Chain (Stage 4 – ein Reboot fehlt)
+    2 -> in der DB UND bootet vom 2023 Boot Manager (= fertig)
+    (Wert liegt je nach Build unter ...\Secureboot oder ...\Secureboot\Servicing)
 
   CA2023Status      NotStarted / InProgress / Updated
+  CA2023Error       2147942750 nach 0x100 = Staging-Signal (Reboot fällig), KEIN Fehler
+
+  Voraussetzungen für den Trigger:
+  ────────────────────────────────
+  - Geplanter Task \Microsoft\Windows\PI\Secure-Boot-Update muss existieren
+    (kommt mit dem Juli-2024-CU oder neuer). Fehlt er -> Trigger läuft ins Leere.
+  - Payload-.bin in C:\Windows\System32\SecureBootUpdates. Fehlen sie, schlägt der
+    Legacy-Task mit 0x80070002 fehl. Moderner Weg WinCS (WinCsFlags.exe, Server 2022+/
+    Win11 23H2+) umgeht die .bin-Abhängigkeit.
+  - BitLocker: PCR 7 ändert sich beim Boot-Manager-Wechsel. Vor dem Reboot
+    Suspend-BitLocker -MountPoint C: -RebootCount 1 und Recovery-Key-Escrow prüfen.
 
   Events:
+    1036/1043/1044/1045  Boot-Zeit Kontext-Events (Eventtext lesen)
     1795  Firmware-Übergabe fehlgeschlagen
+    1796/1798  DB/Variablen-Update Ereignisse (Eventtext lesen)
     1797  Update fehlgeschlagen – 2023 CA fehlt in DB
     1800  Reboot nötig
     1801  Update läuft / nicht (vollständig) angewandt
@@ -1136,13 +1360,14 @@ function Show-Help {
   Für RMM-Integration kann das Script nicht-interaktiv laufen:
     .\SecureBoot2023-Toolkit.ps1 -Quick
   Gibt eine Status-Line aus und endet mit Exit-Code:
-    0 = OK (oder N/A: Legacy BIOS, Gen1, SB disabled)
+    0 = OK (Capable=2 / 2023 CAs aktiv, oder N/A: Legacy BIOS, Gen1, SB disabled)
     1 = Action needed
-    2 = Error
+    2 = Error (inkl. BLOCKED: Task fehlt oder Payload/WinCS fehlt)
     3 = Trigger gesetzt (wenn -AutoTrigger genutzt)
   Mit -AutoTrigger wird AvailableUpdates=0x5944 automatisch gesetzt:
     .\SecureBoot2023-Toolkit.ps1 -Quick -AutoTrigger
-  ACHTUNG: -AutoTrigger umgeht alle Sicherheitsabfragen!
+  ACHTUNG: -AutoTrigger umgeht alle Sicherheitsabfragen! Es prüft aber vorher,
+  ob der Task existiert und Payload/WinCS da ist – sonst BLOCKED + Exit 2.
 
   Wichtige Diagnose-Falle:
   ────────────────────────
@@ -1171,12 +1396,16 @@ function Show-Help {
   - andysblog.de "Secure Boot-Zertifikate laufen im Juni 2026 ab"
   - borncity.com  (mehrere ausführliche Artikel)
   - Sioni Secure Boot Zertifikat-Prüfer  (GUI-Tool)
+  - blog.mindcore.dk  Intune-Remediation + 40-Tage-Fallback-Fallstudie (v3/v4)
+  - github.com/mmelkersen/EndpointManager  (Detect/Remediate Client-Skripte)
+  - Microsoft "Registry key updates for Secure Boot" (AvailableUpdates 0x5944-Verlauf)
 
   URLs:
   ─────
   Server Playbook : https://aka.ms/GetSecureBoot
   Doku-Index DE   : https://support.microsoft.com/de-de/help/5062710
   Doku-Index EN   : https://support.microsoft.com/topic/7ff40d33
+  Act-now Blog    : https://techcommunity.microsoft.com/blog/windows-itpro-blog/4426856
 '@ | Write-Host
     Pause-AndContinue
 }
@@ -1249,16 +1478,29 @@ if ($Quick) {
         Write-Output ("$hostname | ERROR | Status={0} Error={1}" -f $r.CA2023Status, $r.CA2023ErrorCode)
         exit 2
     }
-    if ($r.CA2023Status -eq 'Updated' -and $r.FirmwareHas2023CA) {
-        Write-Output "$hostname | OK | 2023 CAs in Firmware aktiv"
+    if ($r.CA2023Capable -eq 2 -or ($r.CA2023Status -eq 'Updated' -and $r.FirmwareHas2023CA)) {
+        Write-Output "$hostname | OK | Capable=2 / 2023 CAs in Firmware aktiv"
         exit 0
+    }
+    if ($r.CA2023Capable -eq 1) {
+        Write-Output "$hostname | ACTION | Stage 4: 2023 CA in DB, Reboot fehlt (Capable=1)"
+        # weiter unten (AutoTrigger setzt hier nichts mehr, da Cert schon in DB)
     }
 
     # Action needed
-    Write-Output ("$hostname | ACTION | Status={0} FirmwareHas2023CA={1} AvailableUpdates={2}" -f `
-        $r.CA2023Status, $r.FirmwareHas2023CA, $r.AvailableUpdates)
+    Write-Output ("$hostname | ACTION | Status={0} Capable={1} FirmwareHas2023CA={2} AvailableUpdates={3}" -f `
+        $r.CA2023Status, $r.CA2023Capable, $r.FirmwareHas2023CA, $r.AvailableUpdates)
 
-    if ($AutoTrigger -and $r.CA2023Status -ne 'InProgress' -and $r.CA2023Status -ne 'Updated') {
+    if ($AutoTrigger -and $r.CA2023Status -ne 'InProgress' -and $r.CA2023Status -ne 'Updated' -and $r.CA2023Capable -ne 2) {
+        $pre = Test-SecureBootPrereqs
+        if (-not $pre.TaskExists) {
+            Write-Output "$hostname | BLOCKED | Secure-Boot-Update Task fehlt (CU Juli 2024+ nötig)"
+            exit 2
+        }
+        if (-not $pre.PayloadOk -and -not $pre.WinCsAvailable) {
+            Write-Output "$hostname | BLOCKED | Payload (.bin) fehlt und kein WinCS -> Risiko 0x80070002"
+            exit 2
+        }
         try {
             New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' `
                 -Name 'AvailableUpdates' -Value 0x5944 -PropertyType DWord -Force | Out-Null
